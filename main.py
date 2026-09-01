@@ -34,6 +34,8 @@ async def on_ready():
 
 @bot.event
 async def on_message_delete(message: discord.Message):
+    print(f"🗑️ DELETE EVENT: {message.id} in {message.channel.id}")
+
     if message.channel.id != LOG_CHANNEL_ID:
         return
     if message.guild is None or message.guild.id != GUILD_ID:
