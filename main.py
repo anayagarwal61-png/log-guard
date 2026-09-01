@@ -28,13 +28,17 @@ bot = commands.Bot(
     intents=intents
 )
 
-# Store messages while the bot is online.
-# This lets us include the original author/content when possible.
+# Messages seen while the bot is online.
+# Used to recover the original author/content after deletion.
 message_cache = {}
+
+# Audit-log entries already used for an alert.
+# Prevents accidentally attributing the same deletion twice.
+used_audit_entries = set()
 
 
 # ============================================================
-# SEND DM ALERT
+# SEND DM
 # ============================================================
 
 async def send_alert(text: str):
@@ -50,19 +54,19 @@ async def send_alert(text: str):
 
     except discord.Forbidden:
         print(
-            f"❌ Could not DM alert user {ALERT_USER_ID}. "
-            "The user's DMs may be closed."
+            "❌ Could not DM the alert user. "
+            "Their DMs may be closed."
         )
 
     except discord.HTTPException as e:
         print(f"❌ Discord HTTP error while sending DM: {e}")
 
     except Exception as e:
-        print(f"❌ Unexpected error while sending DM: {e}")
+        print(f"❌ Unexpected DM error: {e}")
 
 
 # ============================================================
-# BOT READY
+# READY
 # ============================================================
 
 @bot.event
@@ -75,23 +79,26 @@ async def on_ready():
 
 
 # ============================================================
-# CACHE MESSAGES FROM LOG CHANNEL
+# CACHE LOG MESSAGES
 # ============================================================
 
 @bot.event
 async def on_message(message: discord.Message):
 
     if (
-        message.guild
+        message.guild is not None
         and message.guild.id == GUILD_ID
         and message.channel.id == LOG_CHANNEL_ID
     ):
+
         message_cache[message.id] = {
-            "author": message.author,
+            "author_id": message.author.id,
+            "author_name": str(message.author),
             "content": message.content,
+            "created_at": message.created_at,
         }
 
-        # Prevent unlimited memory usage.
+        # Keep memory under control.
         if len(message_cache) > 5000:
             oldest_id = next(iter(message_cache))
             del message_cache[oldest_id]
@@ -100,37 +107,67 @@ async def on_message(message: discord.Message):
 
 
 # ============================================================
-# FIND WHO DELETED A MESSAGE
+# FIND DELETER
 # ============================================================
 
 async def find_message_deleter(
     guild: discord.Guild,
-    author_id: int,
-    channel_id: int
+    message_author_id: int,
+    channel_id: int,
+    message_created_at
 ):
     """
-    Discord may take a moment to put the deletion into the Audit Log.
-    Check several times before giving up.
+    Try to match the deletion with Discord's Audit Log.
+
+    Discord can take a moment to create the audit-log entry,
+    so we check several times.
+
+    Matching factors:
+      1. Audit action = message delete
+      2. Correct channel
+      3. Correct original message author
+      4. Recent audit entry
+      5. Entry has not already been used
     """
 
-    for attempt in range(5):
+    for attempt in range(6):
 
         try:
-            # Give Discord time to register the audit-log entry.
-            await asyncio.sleep(1)
+
+            # First check happens after a short delay.
+            # Later attempts give Discord additional time.
+            await asyncio.sleep(
+                0.8 if attempt == 0 else 1.0
+            )
+
+            now = discord.utils.utcnow()
 
             async for entry in guild.audit_logs(
-                limit=10,
+                limit=25,
                 action=discord.AuditLogAction.message_delete
             ):
 
-                # Ignore old audit-log entries.
+                # ------------------------------------------------
+                # Don't reuse an audit entry.
+                # ------------------------------------------------
+
+                if entry.id in used_audit_entries:
+                    continue
+
+                # ------------------------------------------------
+                # Only consider very recent entries.
+                # ------------------------------------------------
+
                 age = (
-                    discord.utils.utcnow() - entry.created_at
+                    now - entry.created_at
                 ).total_seconds()
 
-                if age > 15:
+                if age < 0 or age > 20:
                     continue
+
+                # ------------------------------------------------
+                # Get original message author from audit entry.
+                # ------------------------------------------------
 
                 target_id = getattr(
                     entry.target,
@@ -138,32 +175,62 @@ async def find_message_deleter(
                     None
                 )
 
-                extra_channel = getattr(
-                    entry.extra,
+                if target_id != message_author_id:
+                    continue
+
+                # ------------------------------------------------
+                # Get deletion channel from audit entry.
+                # ------------------------------------------------
+
+                extra = getattr(
+                    entry,
+                    "extra",
+                    None
+                )
+
+                audit_channel = getattr(
+                    extra,
                     "channel",
                     None
                 )
 
-                extra_channel_id = getattr(
-                    extra_channel,
+                audit_channel_id = getattr(
+                    audit_channel,
                     "id",
                     None
                 )
 
-                if (
-                    target_id == author_id
-                    and extra_channel_id == channel_id
-                ):
-                    return f"{entry.user} ({entry.user.id})"
+                if audit_channel_id != channel_id:
+                    continue
+
+                # ------------------------------------------------
+                # We found a strong match.
+                # ------------------------------------------------
+
+                used_audit_entries.add(entry.id)
+
+                deleter = entry.user
+
+                print(
+                    "✅ AUDIT MATCH: "
+                    f"{deleter} ({deleter.id}) "
+                    f"| entry={entry.id} "
+                    f"| channel={audit_channel_id}"
+                )
+
+                return (
+                    f"{deleter} ({deleter.id})"
+                )
 
         except discord.Forbidden:
             print(
-                "❌ Bot cannot read the Discord Audit Log."
+                "❌ Cannot read Audit Log. "
+                "Check View Audit Log permission."
             )
 
             return (
-                "Unknown — bot lacks "
-                "View Audit Log permission"
+                "Unknown — bot cannot read "
+                "the Audit Log"
             )
 
         except discord.HTTPException as e:
@@ -173,8 +240,12 @@ async def find_message_deleter(
 
         except Exception as e:
             print(
-                f"⚠️ Unexpected Audit Log error: {e}"
+                f"⚠️ Audit Log matching error: {e}"
             )
+
+    print(
+        "⚠️ No matching Audit Log entry found."
+    )
 
     return (
         "Unknown — Discord did not provide "
@@ -183,7 +254,7 @@ async def find_message_deleter(
 
 
 # ============================================================
-# MESSAGE DELETED
+# SINGLE MESSAGE DELETE
 # ============================================================
 
 @bot.event
@@ -197,15 +268,17 @@ async def on_raw_message_delete(
         f"in {payload.channel_id}"
     )
 
-    # Ignore every channel except your protected log channel.
+    # Only protect the configured log channel.
     if payload.channel_id != LOG_CHANNEL_ID:
         return
 
     # --------------------------------------------------------
-    # GET THE LOG CHANNEL
+    # Get channel
     # --------------------------------------------------------
 
-    channel = bot.get_channel(payload.channel_id)
+    channel = bot.get_channel(
+        payload.channel_id
+    )
 
     if channel is None:
 
@@ -215,7 +288,9 @@ async def on_raw_message_delete(
             )
 
         except discord.NotFound:
-            print("❌ Log channel no longer exists.")
+            print(
+                "❌ Log channel no longer exists."
+            )
             return
 
         except discord.Forbidden:
@@ -231,15 +306,19 @@ async def on_raw_message_delete(
             return
 
     # --------------------------------------------------------
-    # GET GUILD FROM CHANNEL
+    # Get guild directly from channel
     # --------------------------------------------------------
 
-    guild = getattr(channel, "guild", None)
+    guild = getattr(
+        channel,
+        "guild",
+        None
+    )
 
     if guild is None:
         print(
-            "❌ Could not determine the guild "
-            "from the log channel."
+            "❌ Could not determine guild "
+            "from log channel."
         )
         return
 
@@ -252,12 +331,13 @@ async def on_raw_message_delete(
     if guild.id != GUILD_ID:
         print(
             f"⚠️ Guild ID mismatch. "
-            f"Expected {GUILD_ID}, got {guild.id}"
+            f"Expected {GUILD_ID}, "
+            f"got {guild.id}"
         )
         return
 
     # --------------------------------------------------------
-    # GET CACHED MESSAGE INFORMATION
+    # Recover cached message information
     # --------------------------------------------------------
 
     cached = message_cache.pop(
@@ -267,22 +347,26 @@ async def on_raw_message_delete(
 
     if cached:
 
-        author = cached["author"]
+        author_id = cached["author_id"]
+        author_name = cached["author_name"]
         content = cached["content"]
+        message_created_at = cached["created_at"]
 
-        author_id = author.id
         author_text = (
-            f"{author} ({author.id})"
+            f"{author_name} ({author_id})"
         )
 
         if content:
             content_preview = content[:500]
         else:
-            content_preview = "(no text content)"
+            content_preview = (
+                "(no text content)"
+            )
 
     else:
 
         author_id = None
+        message_created_at = None
 
         author_text = (
             "Unknown — message was not cached"
@@ -293,15 +377,16 @@ async def on_raw_message_delete(
         )
 
     # --------------------------------------------------------
-    # FIND DELETER
+    # Find who deleted it
     # --------------------------------------------------------
 
     if author_id is not None:
 
         deleter = await find_message_deleter(
             guild=guild,
-            author_id=author_id,
-            channel_id=LOG_CHANNEL_ID
+            message_author_id=author_id,
+            channel_id=LOG_CHANNEL_ID,
+            message_created_at=message_created_at
         )
 
     else:
@@ -311,14 +396,14 @@ async def on_raw_message_delete(
             "was not cached"
         )
 
+    # --------------------------------------------------------
+    # Send alert
+    # --------------------------------------------------------
+
     print(
         f"🚨 Sending deletion alert. "
         f"Deleted by: {deleter}"
     )
-
-    # --------------------------------------------------------
-    # SEND ALERT
-    # --------------------------------------------------------
 
     await send_alert(
         "⚠️ **LOG MESSAGE DELETED**\n\n"
@@ -332,7 +417,7 @@ async def on_raw_message_delete(
 
 
 # ============================================================
-# BULK MESSAGE DELETE
+# BULK DELETE
 # ============================================================
 
 @bot.event
@@ -354,22 +439,27 @@ async def on_raw_bulk_message_delete(
     )
 
     if channel is None:
+
         try:
             channel = await bot.fetch_channel(
                 payload.channel_id
             )
+
         except Exception as e:
             print(
                 f"❌ Could not fetch channel: {e}"
             )
             return
 
-    guild = getattr(channel, "guild", None)
+    guild = getattr(
+        channel,
+        "guild",
+        None
+    )
 
     if guild is None:
         print(
-            "❌ Could not determine guild "
-            "for bulk deletion."
+            "❌ Could not determine guild."
         )
         return
 
@@ -416,14 +506,13 @@ async def on_guild_channel_delete(
         "from Audit Log"
     )
 
-    # Give Discord a moment to register
-    # the channel deletion in the Audit Log.
+    # Give Discord time to record the deletion.
     await asyncio.sleep(1)
 
     try:
 
         async for entry in channel.guild.audit_logs(
-            limit=10,
+            limit=25,
             action=discord.AuditLogAction.channel_delete
         ):
 
@@ -433,7 +522,15 @@ async def on_guild_channel_delete(
                 None
             )
 
-            if target_id == channel.id:
+            age = (
+                discord.utils.utcnow()
+                - entry.created_at
+            ).total_seconds()
+
+            if (
+                target_id == channel.id
+                and 0 <= age <= 20
+            ):
 
                 deleter = (
                     f"{entry.user} "
@@ -474,7 +571,7 @@ async def on_guild_channel_delete(
 
 
 # ============================================================
-# START BOT
+# START
 # ============================================================
 
 if __name__ == "__main__":
